@@ -5,7 +5,8 @@ import tempfile
 from flask_cors import CORS
 from datetime import datetime
 import logging
-import traceback
+from docx2pdf import convert
+import pythoncom
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,10 +19,10 @@ CORS(app)
 @app.route('/')
 def home():
     return jsonify({
-        "service": "PDF to Word Converter",
-        "version": "1.0",
+        "service": "PDF to Word & Word to PDF Converter",
+        "version": "2.0",
         "license": "GNU AGPL v3.0",
-        "source_code": "https://github.com/ArtifexSoftware/pdf2docx",
+        "source_code": "https://github.com/your-username/pdf2docx",
         "legal_notice": "This service uses pdf2docx licensed under GNU AGPL v3.0"
     })
 
@@ -29,14 +30,11 @@ def home():
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
 
-@app.route('/convert', methods=['POST', 'OPTIONS'])
+@app.route('/convert', methods=['POST'])
 def convert_pdf_to_word():
     """
     Convert PDF to Word document
     """
-    if request.method == 'OPTIONS':
-        return '', 200
-        
     try:
         # Check if file was uploaded
         if 'file' not in request.files:
@@ -54,18 +52,14 @@ def convert_pdf_to_word():
             logger.error(f"Invalid file type: {file.filename}")
             return jsonify({'error': 'File must be a PDF'}), 400
         
-        # Check file size (limit to 10MB for free tier)
+        # Check file size (limit to 15MB for free tier)
         file.seek(0, os.SEEK_END)
         file_length = file.tell()
         file.seek(0)
         
-        if file_length > 10 * 1024 * 1024:  # 10MB limit
+        if file_length > 15 * 1024 * 1024:  # 15MB limit
             logger.error(f"File too large: {file_length} bytes")
-            return jsonify({'error': 'File size must be less than 10MB'}), 400
-        
-        if file_length == 0:
-            logger.error("Empty file")
-            return jsonify({'error': 'File is empty'}), 400
+            return jsonify({'error': 'File size must be less than 15MB'}), 400
         
         # Get conversion parameters
         page_range = request.form.get('page_range', '')
@@ -87,39 +81,29 @@ def convert_pdf_to_word():
             # Set conversion options
             convert_kwargs = {}
             if page_range:
-                try:
-                    pages = parse_page_range(page_range)
-                    if pages:
-                        convert_kwargs['pages'] = pages
-                except ValueError as e:
-                    logger.warning(f"Invalid page range '{page_range}': {e}")
+                convert_kwargs['pages'] = parse_page_range(page_range)
+            
+            if image_quality == 'low':
+                convert_kwargs['rotate_page'] = False
             
             # Perform conversion
             cv.convert(docx_path, **convert_kwargs)
             cv.close()
             
-            # Check if conversion was successful
-            if not os.path.exists(docx_path):
-                raise Exception("Conversion failed - no output file created")
-            
-            file_size = os.path.getsize(docx_path)
-            logger.info(f"Conversion successful: {docx_path} ({file_size} bytes)")
+            logger.info(f"Conversion successful: {docx_path}")
             
             # Return the converted file
             download_name = file.filename.replace('.pdf', '.docx').replace('.PDF', '.docx')
             
-            response = send_file(
+            return send_file(
                 docx_path,
                 as_attachment=True,
                 download_name=download_name,
                 mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             )
             
-            return response
-            
         except Exception as conversion_error:
             logger.error(f"Conversion failed: {str(conversion_error)}")
-            logger.error(traceback.format_exc())
             return jsonify({'error': f'Conversion failed: {str(conversion_error)}'}), 500
             
         finally:
@@ -129,7 +113,86 @@ def convert_pdf_to_word():
                 
     except Exception as e:
         logger.error(f"Server error: {str(e)}")
-        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/word-to-pdf', methods=['POST'])
+def convert_word_to_pdf():
+    """
+    Convert Word document to PDF
+    """
+    try:
+        # Check if file was uploaded
+        if 'file' not in request.files:
+            logger.error("No file provided in request")
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        
+        # Validate file
+        if file.filename == '':
+            logger.error("Empty filename")
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Check for Word document formats
+        valid_extensions = ['.docx', '.doc']
+        file_ext = os.path.splitext(file.filename.lower())[1]
+        if file_ext not in valid_extensions:
+            logger.error(f"Invalid file type: {file.filename}")
+            return jsonify({'error': 'File must be a Word document (.docx or .doc)'}), 400
+        
+        # Check file size (limit to 15MB for free tier)
+        file.seek(0, os.SEEK_END)
+        file_length = file.tell()
+        file.seek(0)
+        
+        if file_length > 15 * 1024 * 1024:  # 15MB limit
+            logger.error(f"File too large: {file_length} bytes")
+            return jsonify({'error': 'File size must be less than 15MB'}), 400
+        
+        logger.info(f"Converting Word to PDF: {file.filename}, size: {file_length} bytes")
+        
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as word_temp:
+            word_path = word_temp.name
+            file.save(word_path)
+        
+        pdf_path = word_path.replace(file_ext, '.pdf')
+        
+        try:
+            # Initialize COM for Windows (required for docx2pdf)
+            pythoncom.CoInitialize()
+            
+            # Convert Word to PDF
+            convert(word_path, pdf_path)
+            
+            logger.info(f"Conversion successful: {pdf_path}")
+            
+            # Return the converted file
+            download_name = file.filename.replace(file_ext, '.pdf')
+            
+            return send_file(
+                pdf_path,
+                as_attachment=True,
+                download_name=download_name,
+                mimetype='application/pdf'
+            )
+            
+        except Exception as conversion_error:
+            logger.error(f"Conversion failed: {str(conversion_error)}")
+            return jsonify({'error': f'Conversion failed: {str(conversion_error)}'}), 500
+            
+        finally:
+            # Clean up temporary files
+            cleanup_file(word_path)
+            cleanup_file(pdf_path)
+            # Uninitialize COM
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Server error: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 def parse_page_range(page_range_str):
