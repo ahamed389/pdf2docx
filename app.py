@@ -5,8 +5,12 @@ import tempfile
 from flask_cors import CORS
 from datetime import datetime
 import logging
-from docx2pdf import convert
-import pythoncom
+from docx import Document
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import io
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -118,7 +122,7 @@ def convert_pdf_to_word():
 @app.route('/word-to-pdf', methods=['POST'])
 def convert_word_to_pdf():
     """
-    Convert Word document to PDF
+    Convert Word document to PDF using python-docx and reportlab
     """
     try:
         # Check if file was uploaded
@@ -149,47 +153,132 @@ def convert_word_to_pdf():
             logger.error(f"File too large: {file_length} bytes")
             return jsonify({'error': 'File size must be less than 15MB'}), 400
         
+        # Get conversion parameters
+        page_size = request.form.get('page_size', 'a4')
+        orientation = request.form.get('orientation', 'portrait')
+        
         logger.info(f"Converting Word to PDF: {file.filename}, size: {file_length} bytes")
         
-        # Create temporary files
-        with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as word_temp:
-            word_path = word_temp.name
-            file.save(word_path)
-        
-        pdf_path = word_path.replace(file_ext, '.pdf')
-        
         try:
-            # Initialize COM for Windows (required for docx2pdf)
-            pythoncom.CoInitialize()
+            # Read Word document
+            doc = Document(file)
             
-            # Convert Word to PDF
-            convert(word_path, pdf_path)
+            # Create PDF in memory
+            pdf_buffer = io.BytesIO()
             
-            logger.info(f"Conversion successful: {pdf_path}")
+            # Set page size
+            page_sizes = {
+                'a4': A4,
+                'letter': letter,
+                'legal': (612, 1008)  # 8.5 x 14 inches
+            }
+            
+            selected_size = page_sizes.get(page_size.lower(), A4)
+            
+            # Adjust for orientation
+            if orientation == 'landscape':
+                selected_size = (selected_size[1], selected_size[0])
+            
+            # Create PDF canvas
+            c = canvas.Canvas(pdf_buffer, pagesize=selected_size)
+            width, height = selected_size
+            
+            # Set margins
+            margin = 50
+            y_position = height - margin
+            line_height = 14
+            
+            # Add document title
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(margin, y_position, f"Converted from: {file.filename}")
+            y_position -= line_height * 2
+            
+            # Add conversion info
+            c.setFont("Helvetica", 10)
+            c.drawString(margin, y_position, f"Conversion Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            y_position -= line_height
+            c.drawString(margin, y_position, f"Original Format: Word Document")
+            y_position -= line_height
+            c.drawString(margin, y_position, f"Page Size: {page_size.upper()} - {orientation.title()}")
+            y_position -= line_height * 2
+            
+            # Extract and add content from Word document
+            c.setFont("Helvetica", 12)
+            
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():  # Only process non-empty paragraphs
+                    text = paragraph.text
+                    
+                    # Simple text wrapping
+                    words = text.split()
+                    line = []
+                    
+                    for word in words:
+                        test_line = ' '.join(line + [word])
+                        text_width = c.stringWidth(test_line, "Helvetica", 12)
+                        
+                        if text_width < (width - 2 * margin):
+                            line.append(word)
+                        else:
+                            # Draw the line
+                            if y_position < margin:
+                                c.showPage()
+                                y_position = height - margin
+                                c.setFont("Helvetica", 12)
+                            
+                            c.drawString(margin, y_position, ' '.join(line))
+                            y_position -= line_height
+                            line = [word]
+                    
+                    # Draw remaining words
+                    if line:
+                        if y_position < margin:
+                            c.showPage()
+                            y_position = height - margin
+                            c.setFont("Helvetica", 12)
+                        
+                        c.drawString(margin, y_position, ' '.join(line))
+                        y_position -= line_height
+                
+                # Add some space between paragraphs
+                y_position -= line_height / 2
+                
+                # Check if we need a new page
+                if y_position < margin:
+                    c.showPage()
+                    y_position = height - margin
+                    c.setFont("Helvetica", 12)
+            
+            # Add footer with page numbers
+            c.setFont("Helvetica", 8)
+            c.drawString(margin, 30, "Converted with iTrustPDF - Free Online Document Converter")
+            
+            # Save PDF
+            c.save()
+            
+            # Get PDF data
+            pdf_buffer.seek(0)
+            pdf_data = pdf_buffer.getvalue()
+            
+            logger.info("Word to PDF conversion successful")
             
             # Return the converted file
             download_name = file.filename.replace(file_ext, '.pdf')
             
-            return send_file(
-                pdf_path,
-                as_attachment=True,
-                download_name=download_name,
-                mimetype='application/pdf'
+            # Create response with PDF data
+            from flask import Response
+            return Response(
+                pdf_data,
+                mimetype='application/pdf',
+                headers={
+                    'Content-Disposition': f'attachment; filename={download_name}',
+                    'Content-Length': len(pdf_data)
+                }
             )
             
         except Exception as conversion_error:
             logger.error(f"Conversion failed: {str(conversion_error)}")
             return jsonify({'error': f'Conversion failed: {str(conversion_error)}'}), 500
-            
-        finally:
-            # Clean up temporary files
-            cleanup_file(word_path)
-            cleanup_file(pdf_path)
-            # Uninitialize COM
-            try:
-                pythoncom.CoUninitialize()
-            except:
-                pass
                 
     except Exception as e:
         logger.error(f"Server error: {str(e)}")
