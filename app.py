@@ -5,6 +5,7 @@ import tempfile
 from flask_cors import CORS
 from datetime import datetime
 import logging
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +21,7 @@ def home():
         "service": "PDF to Word Converter",
         "version": "1.0",
         "license": "GNU AGPL v3.0",
-        "source_code": "https://github.com/your-username/pdf2docx",
+        "source_code": "https://github.com/ArtifexSoftware/pdf2docx",
         "legal_notice": "This service uses pdf2docx licensed under GNU AGPL v3.0"
     })
 
@@ -28,11 +29,14 @@ def home():
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
 
-@app.route('/convert', methods=['POST'])
+@app.route('/convert', methods=['POST', 'OPTIONS'])
 def convert_pdf_to_word():
     """
     Convert PDF to Word document
     """
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         # Check if file was uploaded
         if 'file' not in request.files:
@@ -50,14 +54,18 @@ def convert_pdf_to_word():
             logger.error(f"Invalid file type: {file.filename}")
             return jsonify({'error': 'File must be a PDF'}), 400
         
-        # Check file size (limit to 15MB for free tier)
+        # Check file size (limit to 10MB for free tier)
         file.seek(0, os.SEEK_END)
         file_length = file.tell()
         file.seek(0)
         
-        if file_length > 15 * 1024 * 1024:  # 15MB limit
+        if file_length > 10 * 1024 * 1024:  # 10MB limit
             logger.error(f"File too large: {file_length} bytes")
-            return jsonify({'error': 'File size must be less than 15MB'}), 400
+            return jsonify({'error': 'File size must be less than 10MB'}), 400
+        
+        if file_length == 0:
+            logger.error("Empty file")
+            return jsonify({'error': 'File is empty'}), 400
         
         # Get conversion parameters
         page_range = request.form.get('page_range', '')
@@ -79,29 +87,39 @@ def convert_pdf_to_word():
             # Set conversion options
             convert_kwargs = {}
             if page_range:
-                convert_kwargs['pages'] = parse_page_range(page_range)
-            
-            if image_quality == 'low':
-                convert_kwargs['rotate_page'] = False
+                try:
+                    pages = parse_page_range(page_range)
+                    if pages:
+                        convert_kwargs['pages'] = pages
+                except ValueError as e:
+                    logger.warning(f"Invalid page range '{page_range}': {e}")
             
             # Perform conversion
             cv.convert(docx_path, **convert_kwargs)
             cv.close()
             
-            logger.info(f"Conversion successful: {docx_path}")
+            # Check if conversion was successful
+            if not os.path.exists(docx_path):
+                raise Exception("Conversion failed - no output file created")
+            
+            file_size = os.path.getsize(docx_path)
+            logger.info(f"Conversion successful: {docx_path} ({file_size} bytes)")
             
             # Return the converted file
             download_name = file.filename.replace('.pdf', '.docx').replace('.PDF', '.docx')
             
-            return send_file(
+            response = send_file(
                 docx_path,
                 as_attachment=True,
                 download_name=download_name,
                 mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             )
             
+            return response
+            
         except Exception as conversion_error:
             logger.error(f"Conversion failed: {str(conversion_error)}")
+            logger.error(traceback.format_exc())
             return jsonify({'error': f'Conversion failed: {str(conversion_error)}'}), 500
             
         finally:
@@ -111,6 +129,7 @@ def convert_pdf_to_word():
                 
     except Exception as e:
         logger.error(f"Server error: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 def parse_page_range(page_range_str):
@@ -124,11 +143,21 @@ def parse_page_range(page_range_str):
     ranges = page_range_str.split(',')
     
     for r in ranges:
+        r = r.strip()
+        if not r:
+            continue
+            
         if '-' in r:
-            start, end = map(int, r.split('-'))
-            pages.extend(range(start, end + 1))
+            try:
+                start, end = map(int, r.split('-'))
+                pages.extend(range(start, end + 1))
+            except ValueError:
+                raise ValueError(f"Invalid range: {r}")
         else:
-            pages.append(int(r))
+            try:
+                pages.append(int(r))
+            except ValueError:
+                raise ValueError(f"Invalid page number: {r}")
     
     return pages
 
